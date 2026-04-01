@@ -50,6 +50,7 @@ func SetLocation(device ios.DeviceEntry, lat string, lon string) error {
 	if err != nil {
 		return err
 	}
+	defer locationConn.Close()
 
 	latitude, err := strconv.ParseFloat(lat, 64)
 	if err != nil {
@@ -80,7 +81,6 @@ func SetLocation(device ios.DeviceEntry, lat string, lon string) error {
 		return err
 	}
 
-	locationConn.Close()
 	return nil
 }
 
@@ -179,6 +179,7 @@ func ResetLocation(device ios.DeviceEntry) error {
 	if err != nil {
 		return err
 	}
+	defer locationConn.Close()
 
 	buf := new(bytes.Buffer)
 
