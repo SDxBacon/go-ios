@@ -1,6 +1,7 @@
 package ios
 
 import (
+	"encoding/json"
 	"github.com/stretchr/testify/assert"
 	"strings"
 	"testing"
@@ -18,6 +19,28 @@ func TestGetRsdPorts(t *testing.T) {
 		syslog := rsd.GetPort("com.apple.syslog_relay")
 		assert.Equal(t, 50343, syslog)
 	})
+}
+
+func TestParseRsdHandshakeResponseIncludesProperties(t *testing.T) {
+	var raw map[string]interface{}
+	assert.NoError(t, json.Unmarshal([]byte(rsdOutput), &raw))
+
+	response, err := parseRsdHandshakeResponse(raw)
+	assert.NoError(t, err)
+	assert.Equal(t, "00008020-001950CC01EA002E", response.Udid)
+	assert.Equal(t, "17.0.3", response.Properties["OSVersion"])
+	assert.Equal(t, "iPhone11,6", response.Properties["ProductType"])
+	assert.Equal(t, 50372, response.GetPort("com.apple.mobile.lockdown.remote.trusted"))
+}
+
+func TestRsdHandshakeResponseGetPortFallsBackToShimRemote(t *testing.T) {
+	response := RsdHandshakeResponse{
+		Services: map[string]RsdServiceEntry{
+			"com.apple.mobile.mobile_image_mounter.shim.remote": {Port: 50322},
+		},
+	}
+
+	assert.Equal(t, 50322, response.GetPort("com.apple.mobile.mobile_image_mounter"))
 }
 
 const rsdOutput = `

@@ -42,7 +42,7 @@ func TestWriteEvent(t *testing.T) {
 				},
 			},
 			"originatedBy":   "host",
-			"sequenceNumber": uint64(1),
+			"sequenceNumber": uint64(0),
 		},
 	}
 
@@ -83,7 +83,7 @@ func TestReadWriteRequest(t *testing.T) {
 				},
 			},
 			"originatedBy":   "host",
-			"sequenceNumber": uint64(1),
+			"sequenceNumber": uint64(0),
 		},
 	}
 
@@ -113,10 +113,10 @@ func TestWriteIncrementsSequenceNumber(t *testing.T) {
 
 	err := rw.writeEvent(&event)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(2), rw.seqNr)
+	assert.Equal(t, uint64(1), rw.seqNr)
 	err = rw.writeEvent(&event)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(3), rw.seqNr)
+	assert.Equal(t, uint64(2), rw.seqNr)
 }
 
 func TestReadWriteCipher(t *testing.T) {
@@ -147,7 +147,7 @@ func TestReadWriteCipher(t *testing.T) {
 				},
 			},
 			"originatedBy":   "host",
-			"sequenceNumber": uint64(1),
+			"sequenceNumber": uint64(0),
 		},
 	}
 

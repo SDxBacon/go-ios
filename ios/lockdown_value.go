@@ -252,6 +252,9 @@ func getAllValuesResponseFromBytes(plistBytes []byte) GetAllValuesResponse {
 
 // GetValuesPlist returns the full lockdown values response as a map, so it can be converted to JSON easily.
 func GetValuesPlist(device DeviceEntry) (map[string]interface{}, error) {
+	if device.SupportsRsd() {
+		return GetRemoteValuesPlist(device)
+	}
 	lockdownConnection, err := ConnectLockdownWithSession(device)
 	if err != nil {
 		return map[string]interface{}{}, err
@@ -278,6 +281,9 @@ func GetValuesPlist(device DeviceEntry) (map[string]interface{}, error) {
 
 // GetValues returns all values of deviceInformation from lockdown
 func GetValues(device DeviceEntry) (GetAllValuesResponse, error) {
+	if device.SupportsRsd() {
+		return GetRemoteValues(device)
+	}
 	lockdownConnection, err := ConnectLockdownWithSession(device)
 	if err != nil {
 		return GetAllValuesResponse{}, err

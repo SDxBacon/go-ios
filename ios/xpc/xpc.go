@@ -63,7 +63,11 @@ func (c *Connection) Send(data map[string]interface{}, flags ...uint32) error {
 		Body:  data,
 		Id:    c.msgId,
 	}
-	return EncodeMessage(c.clientServer, msg)
+	if err := EncodeMessage(c.clientServer, msg); err != nil {
+		return err
+	}
+	c.msgId++
+	return nil
 }
 
 func (c *Connection) Close() error {

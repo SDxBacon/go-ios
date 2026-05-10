@@ -283,6 +283,9 @@ func sendUploadRequest(plistRw ios.PlistCodecReadWriter, imageType string, signa
 
 // Check if developer mode is enabled through the mobile_image_mounter service
 func IsDevModeEnabled(device ios.DeviceEntry) (bool, error) {
+	if device.SupportsRsd() {
+		return ios.GetRemoteDeveloperModeStatus(device)
+	}
 	conn, err := ios.ConnectToService(device, serviceName)
 	if err != nil {
 		return false, fmt.Errorf("IsDevModeEnabled: failed connecting to image mounter service with err: %w", err)

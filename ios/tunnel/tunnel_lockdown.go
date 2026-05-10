@@ -35,33 +35,21 @@ func connectToTunnelLockdown(ctx context.Context, device ios.DeviceEntry, connTo
 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
 	}
 
-	// we want a copy of the parent ctx here, but it shouldn't time out/be cancelled at the same time.
-	// doing it like this allows us to have a context with a timeout for the tunnel creation, but the tunnel itself
-	tunnelCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-
-	go func() {
-		err := forwardTCPToInterface(tunnelCtx, tunnelInfo.ClientParameters.Mtu, connToDevice, utunIface)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to tunnel interface")
-		}
-	}()
-
-	go func() {
-		err := forwardTUNToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, connToDevice)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to the device")
-		}
-	}()
-
-	closeFunc := func() error {
-		cancel()
+	tunnelCtx, runtime := newTunnelRuntime(ctx, func() error {
 		return errors.Join(utunIface.Close(), connToDevice.Close())
-	}
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to tunnel interface", func() error {
+		return forwardTCPToInterface(tunnelCtx, tunnelInfo.ClientParameters.Mtu, connToDevice, utunIface)
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to the device", func() error {
+		return forwardTUNToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, connToDevice)
+	})
 	return Tunnel{
 		Address: tunnelInfo.ServerAddress,
 		RsdPort: int(tunnelInfo.ServerRSDPort),
 		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		closer:  runtime.close,
+		done:    runtime.done,
 	}, nil
 }
 

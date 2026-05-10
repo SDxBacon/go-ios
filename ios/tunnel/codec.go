@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"crypto/cipher"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,17 @@ import (
 type eventCodec interface {
 	Encode() map[string]interface{}
 	Decode(e map[string]interface{}) error
+}
+
+// controlChannelIO abstracts the control channel transport so that both the RemoteXPC-based
+// channel (controlChannelReadWriter) and the plain-TCP RPPairing channel (rpPairingChannel)
+// can be used interchangeably by tunnelService and cipherStream.
+type controlChannelIO interface {
+	writeRequest(req map[string]interface{}) error
+	writeEvent(e eventCodec) error
+	read() (map[string]interface{}, error)
+	readEvent(e eventCodec) error
+	write(message map[string]interface{}) error
 }
 
 type pairingData struct {
@@ -37,7 +49,7 @@ func (p *pairingData) Decode(e map[string]interface{}) error {
 	if err != nil {
 		return err
 	}
-	if data, ok := pd["data"].([]byte); ok {
+	if data, ok := coerceBytes(pd["data"]); ok {
 		p.data = data
 	}
 	if kind, ok := pd["kind"].(string); ok {
@@ -63,6 +75,22 @@ func (p pairVerifyFailed) Encode() map[string]interface{} {
 
 func (p pairVerifyFailed) Decode(_ map[string]interface{}) error {
 	return nil
+}
+
+// coerceBytes converts an interface{} to []byte, accepting both native []byte
+// (XPC transport) and base64-encoded strings (RPPairing JSON transport).
+func coerceBytes(v interface{}) ([]byte, bool) {
+	switch t := v.(type) {
+	case []byte:
+		return t, true
+	case string:
+		b, err := base64.StdEncoding.DecodeString(t)
+		if err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	return nil, false
 }
 
 func getChildMap(m map[string]interface{}, keys ...string) (map[string]interface{}, error) {
@@ -99,7 +127,7 @@ type controlChannelReadWriter struct {
 
 func newControlChannelReadWriter(conn xpcConn) *controlChannelReadWriter {
 	return &controlChannelReadWriter{
-		seqNr: 1,
+		seqNr: 0,
 		conn:  conn,
 	}
 }
@@ -166,16 +194,24 @@ func (c *controlChannelReadWriter) write(message map[string]interface{}) error {
 }
 
 func (c *controlChannelReadWriter) read() (map[string]interface{}, error) {
-	p, err := c.conn.ReceiveOnClientServerStream()
-	if err != nil {
-		return nil, err
+	for {
+		p, err := c.conn.ReceiveOnClientServerStream()
+		if err != nil {
+			return nil, err
+		}
+		if message, err := getChildMap(p, "message"); err == nil {
+			return message, nil
+		}
+		value, err := getChildMap(p, "value")
+		if err != nil {
+			continue
+		}
+		message, err := getChildMap(value, "message")
+		if err != nil {
+			continue
+		}
+		return message, nil
 	}
-	value, err := getChildMap(p, "value")
-	if err != nil {
-		return nil, err
-	}
-
-	return getChildMap(value, "message")
 }
 
 // cipherStream encrypts and decrypts payloads embedded into 'RemotePairing.ControlChannelMessageEnvelope' messages
@@ -184,14 +220,14 @@ func (c *controlChannelReadWriter) read() (map[string]interface{}, error) {
 // the host. This message pair uses the same nonce before that counter is increased for the next message from the host
 // to the device
 type cipherStream struct {
-	controlChannel *controlChannelReadWriter
+	controlChannel controlChannelIO
 	clientCipher   cipher.AEAD
 	serverCipher   cipher.AEAD
 	nonce          []byte
 	sequence       uint64
 }
 
-func newCipherStream(controlChannel *controlChannelReadWriter, clientCipher, serverCipher cipher.AEAD) *cipherStream {
+func newCipherStream(controlChannel controlChannelIO, clientCipher, serverCipher cipher.AEAD) *cipherStream {
 	return &cipherStream{
 		controlChannel: controlChannel,
 		clientCipher:   clientCipher,
@@ -222,7 +258,7 @@ func (c *cipherStream) read(p *map[string]interface{}) error {
 		return err
 	}
 	if streamEncr, err := getChildMap(m, "streamEncrypted"); err == nil {
-		if cip, ok := streamEncr["_0"].([]byte); ok {
+		if cip, ok := coerceBytes(streamEncr["_0"]); ok {
 			plain, err := c.serverCipher.Open(nil, c.nonce, cip, nil)
 			if err != nil {
 				return err

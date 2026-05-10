@@ -12,12 +12,17 @@ import (
 
 const serviceName string = "com.apple.amfi.lockdown"
 
+var ErrAMFIRequiresUSB = errors.New("AMFI developer mode actions require USB/legacy lockdown; RSD/WiFi Direct only supports DeveloperModeStatus query")
+
 type Connection struct {
 	deviceConn ios.DeviceConnectionInterface
 	plistCodec ios.PlistCodec
 }
 
 func New(device ios.DeviceEntry) (*Connection, error) {
+	if device.SupportsRsd() {
+		return &Connection{}, ErrAMFIRequiresUSB
+	}
 	deviceConn, err := ios.ConnectToService(device, serviceName)
 	if err != nil {
 		return &Connection{}, err

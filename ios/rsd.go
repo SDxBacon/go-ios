@@ -134,8 +134,9 @@ type RsdServiceEntry struct {
 // RsdHandshakeResponse is the response to the RSDCheckin request and contains the UDID
 // and the services available on the device.
 type RsdHandshakeResponse struct {
-	Udid     string
-	Services map[string]RsdServiceEntry
+	Udid       string
+	Properties map[string]interface{}
+	Services   map[string]RsdServiceEntry
 }
 
 // GetService returns the service name for the given port.
@@ -151,6 +152,10 @@ func (r RsdHandshakeResponse) GetService(p int) string {
 // GetPort returns the port for the given service.
 func (r RsdHandshakeResponse) GetPort(service string) int {
 	if s, ok := r.Services[service]; ok {
+		return int(s.Port)
+	}
+	if s, ok := r.Services[fmt.Sprintf("%s.shim.remote", service)]; ok {
+		log.Debugf("returning port of '%s'-shim", service)
 		return int(s.Port)
 	}
 	return 0
@@ -209,8 +214,14 @@ func (s RsdService) Handshake() (RsdHandshakeResponse, error) {
 	if err != nil {
 		return RsdHandshakeResponse{}, fmt.Errorf("Handshake: failed to receive handshake response. %w", err)
 	}
+	return parseRsdHandshakeResponse(m)
+}
+
+func parseRsdHandshakeResponse(m map[string]interface{}) (RsdHandshakeResponse, error) {
 	udid := ""
-	if properties, ok := m["Properties"].(map[string]interface{}); ok {
+	var properties map[string]interface{}
+	if p, ok := m["Properties"].(map[string]interface{}); ok {
+		properties = p
 		if u, ok := properties["UniqueDeviceID"].(string); ok {
 			udid = u
 		}
@@ -232,8 +243,9 @@ func (s RsdService) Handshake() (RsdHandshakeResponse, error) {
 			}
 		}
 		return RsdHandshakeResponse{
-			Services: res,
-			Udid:     udid,
+			Services:   res,
+			Udid:       udid,
+			Properties: properties,
 		}, nil
 	} else {
 		return RsdHandshakeResponse{}, fmt.Errorf("Handshake: unknown response")

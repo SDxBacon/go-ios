@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
@@ -36,11 +37,74 @@ type Tunnel struct {
 	UserspaceTUN     bool `json:"userspaceTun"`
 	UserspaceTUNPort int  `json:"userspaceTunPort"`
 	closer           func() error
+	done             <-chan struct{}
 }
 
 // Close closes the connection to the device and removes the virtual network interface from the host
 func (t Tunnel) Close() error {
+	if t.closer == nil {
+		return nil
+	}
 	return t.closer()
+}
+
+// Done returns a channel that is closed when the tunnel is closed or the
+// underlying tunnel transport exits unexpectedly.
+func (t Tunnel) Done() <-chan struct{} {
+	if t.done == nil {
+		return closedTunnelDone()
+	}
+	return t.done
+}
+
+var closedTunnelDoneOnce struct {
+	sync.Once
+	ch chan struct{}
+}
+
+func closedTunnelDone() <-chan struct{} {
+	closedTunnelDoneOnce.Do(func() {
+		closedTunnelDoneOnce.ch = make(chan struct{})
+		close(closedTunnelDoneOnce.ch)
+	})
+	return closedTunnelDoneOnce.ch
+}
+
+type tunnelRuntime struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeFn   func() error
+	closeErr  error
+}
+
+func newTunnelRuntime(parent context.Context, closeFn func() error) (context.Context, *tunnelRuntime) {
+	tunnelCtx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	return tunnelCtx, &tunnelRuntime{
+		done:    make(chan struct{}),
+		cancel:  cancel,
+		closeFn: closeFn,
+	}
+}
+
+func (r *tunnelRuntime) close() error {
+	r.closeOnce.Do(func() {
+		r.cancel()
+		if r.closeFn != nil {
+			r.closeErr = r.closeFn()
+		}
+		close(r.done)
+	})
+	return r.closeErr
+}
+
+func (r *tunnelRuntime) runForward(ctx context.Context, label string, fn func() error) {
+	go func() {
+		if err := fn(); err != nil && ctx.Err() == nil {
+			logrus.WithError(err).Error(label)
+		}
+		_ = r.close()
+	}()
 }
 
 // ManualPairAndConnectToTunnel tries to verify an existing pairing, and if this fails it triggers a new manual pairing process.
@@ -141,36 +205,71 @@ func connectToTunnel(ctx context.Context, info tunnelListener, addr string, devi
 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
 	}
 
-	// we want a copy of the parent ctx here, but it shouldn't time out/be cancelled at the same time.
-	// doing it like this allows us to have a context with a timeout for the tunnel creation, but the tunnel itself
-	tunnelCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-
-	go func() {
-		err := forwardDataToInterface(tunnelCtx, conn, utunIface)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to tunnel interface")
-		}
-	}()
-
-	go func() {
-		err := forwardDataToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, conn)
-		if err != nil {
-			logrus.WithError(err).Error("failed to forward data to the device")
-		}
-	}()
-
-	closeFunc := func() error {
-		cancel()
+	tunnelCtx, runtime := newTunnelRuntime(ctx, func() error {
 		quicErr := conn.CloseWithError(0, "")
 		utunErr := utunIface.Close()
 		return errors.Join(quicErr, utunErr)
-	}
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to tunnel interface", func() error {
+		return forwardDataToInterface(tunnelCtx, conn, utunIface)
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to the device", func() error {
+		return forwardDataToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, conn)
+	})
 
 	return Tunnel{
 		Address: tunnelInfo.ServerAddress,
 		RsdPort: int(tunnelInfo.ServerRSDPort),
 		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		closer:  runtime.close,
+		done:    runtime.done,
+	}, nil
+}
+
+func connectToTCPTunnel(ctx context.Context, info tcpTunnelListener, encryptionKey []byte, addr string, device ios.DeviceEntry) (Tunnel, error) {
+	logrus.WithField("address", addr).WithField("port", info.TunnelPort).Info("connect to TCP tunnel endpoint on device")
+	if len(encryptionKey) == 0 {
+		return Tunnel{}, fmt.Errorf("connectToTCPTunnel: missing encryption key")
+	}
+
+	tcpConn, err := dialManualPair(ctx, addr, int(info.TunnelPort))
+	if err != nil {
+		return Tunnel{}, fmt.Errorf("connectToTCPTunnel: dial: %w", err)
+	}
+	conn, err := newTLSPSKClient(tcpConn, encryptionKey)
+	if err != nil {
+		tcpConn.Close()
+		return Tunnel{}, fmt.Errorf("connectToTCPTunnel: TLS-PSK handshake: %w", err)
+	}
+
+	tunnelInfo, err := exchangeCoreTunnelParameters(conn)
+	if err != nil {
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("could not exchange tunnel parameters. %w", err)
+	}
+
+	utunIface, err := setupTunnelInterface(tunnelInfo)
+	if err != nil {
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
+	}
+
+	tunnelCtx, runtime := newTunnelRuntime(ctx, func() error {
+		return errors.Join(utunIface.Close(), conn.Close())
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to tunnel interface", func() error {
+		return forwardTCPToInterface(tunnelCtx, tunnelInfo.ClientParameters.Mtu, conn, utunIface)
+	})
+	runtime.runForward(tunnelCtx, "failed to forward data to the device", func() error {
+		return forwardTUNToDevice(tunnelCtx, tunnelInfo.ClientParameters.Mtu, utunIface, conn)
+	})
+
+	return Tunnel{
+		Address: tunnelInfo.ServerAddress,
+		RsdPort: int(tunnelInfo.ServerRSDPort),
+		Udid:    device.Properties.SerialNumber,
+		closer:  runtime.close,
+		done:    runtime.done,
 	}, nil
 }
 

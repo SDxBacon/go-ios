@@ -25,6 +25,45 @@ import (
 // ioResourceCloser is a type for closing function.
 type ioResourceCloser func()
 
+type tunnelDoneReadWriteCloser struct {
+	io.ReadWriteCloser
+	notify func()
+	once   sync.Once
+}
+
+func newTunnelDoneReadWriteCloser(rw io.ReadWriteCloser, notify func()) io.ReadWriteCloser {
+	return &tunnelDoneReadWriteCloser{ReadWriteCloser: rw, notify: notify}
+}
+
+func (rw *tunnelDoneReadWriteCloser) Read(p []byte) (int, error) {
+	n, err := rw.ReadWriteCloser.Read(p)
+	if err != nil {
+		rw.notifyDone()
+	}
+	return n, err
+}
+
+func (rw *tunnelDoneReadWriteCloser) Write(p []byte) (int, error) {
+	n, err := rw.ReadWriteCloser.Write(p)
+	if err != nil {
+		rw.notifyDone()
+	}
+	return n, err
+}
+
+func (rw *tunnelDoneReadWriteCloser) Close() error {
+	err := rw.ReadWriteCloser.Close()
+	rw.notifyDone()
+	return err
+}
+
+func (rw *tunnelDoneReadWriteCloser) notifyDone() {
+	if rw.notify == nil {
+		return
+	}
+	rw.once.Do(rw.notify)
+}
+
 // createIoCloser returns a ioResourceCloser for closing both writer and together
 func createIoCloser(rw1, rw2 io.ReadWriteCloser) ioResourceCloser {
 
@@ -195,28 +234,131 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 	}
 	const prefixLength = 64
 	iface := UserSpaceTUNInterface{}
-	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), connToDevice, tunnelInfo.ClientParameters.Address, prefixLength)
+	var listener net.Listener
+	tunnelCtx, runtime := newTunnelRuntime(ctx, func() error {
+		if iface.networkStack != nil {
+			iface.networkStack.Close()
+		}
+		var errs []error
+		errs = append(errs, connToDevice.Close())
+		if listener != nil {
+			errs = append(errs, listener.Close())
+		}
+		return errors.Join(errs...)
+	})
+	tunnelConn := newTunnelDoneReadWriteCloser(connToDevice, func() {
+		go func() {
+			_ = runtime.close()
+		}()
+	})
+	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), tunnelConn, tunnelInfo.ClientParameters.Address, prefixLength)
 	if err != nil {
+		_ = runtime.close()
 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
+	listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
 	if err != nil {
+		_ = runtime.close()
 		return Tunnel{}, fmt.Errorf("could not setup listener. %w", err)
 	}
 
-	listener.Addr()
-	go listenToConns(iface, listener)
-
-	closeFunc := func() error {
-		iface.networkStack.Close()
-		return errors.Join(connToDevice.Close(), listener.Close())
+	actualPort := ifacePort
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
 	}
+
+	go func() {
+		if err := listenToConns(iface, listener); err != nil && tunnelCtx.Err() == nil {
+			slog.Error("userspace tunnel listener stopped", "error", err)
+		}
+		_ = runtime.close()
+	}()
+
 	return Tunnel{
-		Address: tunnelInfo.ServerAddress,
-		RsdPort: int(tunnelInfo.ServerRSDPort),
-		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		Address:          tunnelInfo.ServerAddress,
+		RsdPort:          int(tunnelInfo.ServerRSDPort),
+		Udid:             device.Properties.SerialNumber,
+		UserspaceTUN:     true,
+		UserspaceTUNPort: actualPort,
+		closer:           runtime.close,
+		done:             runtime.done,
+	}, nil
+}
+
+func connectToUserspaceTCPTunnel(ctx context.Context, info tcpTunnelListener, encryptionKey []byte, addr string, device ios.DeviceEntry, ifacePort int) (Tunnel, error) {
+	slog.Info("connect to TCP userspace tunnel endpoint on device", "address", addr, "port", info.TunnelPort)
+	if len(encryptionKey) == 0 {
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: missing encryption key")
+	}
+
+	tcpConn, err := dialManualPair(ctx, addr, int(info.TunnelPort))
+	if err != nil {
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: dial: %w", err)
+	}
+	conn, err := newTLSPSKClient(tcpConn, encryptionKey)
+	if err != nil {
+		tcpConn.Close()
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: %w: %v", ErrRemotePairingTLSFailed, err)
+	}
+
+	tunnelInfo, err := exchangeCoreTunnelParameters(conn)
+	if err != nil {
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: %w: %v", ErrRemotePairingCDTunnelFailed, err)
+	}
+
+	const prefixLength = 64
+	iface := UserSpaceTUNInterface{}
+	var listener net.Listener
+	tunnelCtx, runtime := newTunnelRuntime(ctx, func() error {
+		if iface.networkStack != nil {
+			iface.networkStack.Close()
+		}
+		var errs []error
+		errs = append(errs, conn.Close())
+		if listener != nil {
+			errs = append(errs, listener.Close())
+		}
+		return errors.Join(errs...)
+	})
+	tunnelConn := newTunnelDoneReadWriteCloser(conn, func() {
+		go func() {
+			_ = runtime.close()
+		}()
+	})
+	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), tunnelConn, tunnelInfo.ClientParameters.Address, prefixLength)
+	if err != nil {
+		_ = runtime.close()
+		return Tunnel{}, fmt.Errorf("could not setup userspace tunnel interface. %w", err)
+	}
+
+	listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
+	if err != nil {
+		_ = runtime.close()
+		return Tunnel{}, fmt.Errorf("could not setup userspace tunnel listener. %w", err)
+	}
+
+	actualPort := ifacePort
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
+	}
+
+	go func() {
+		if err := listenToConns(iface, listener); err != nil && tunnelCtx.Err() == nil {
+			slog.Error("userspace tunnel listener stopped", "error", err)
+		}
+		_ = runtime.close()
+	}()
+
+	return Tunnel{
+		Address:          tunnelInfo.ServerAddress,
+		RsdPort:          int(tunnelInfo.ServerRSDPort),
+		Udid:             device.Properties.SerialNumber,
+		UserspaceTUN:     true,
+		UserspaceTUNPort: actualPort,
+		closer:           runtime.close,
+		done:             runtime.done,
 	}, nil
 }
 
