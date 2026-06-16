@@ -214,12 +214,18 @@ func ListRunningTunnels(tunnelInfoHost string, tunnelInfoPort int) ([]Tunnel, er
 
 // TunnelManager starts tunnels for devices when needed (if no tunnel is running yet) and stores the information
 // how those tunnels are reachable (address and remote service discovery port)
+type failedDevice struct {
+	lastAttempt time.Time
+	failCount   int
+}
+
 type TunnelManager struct {
 	ts                   tunnelStarter
 	dl                   deviceLister
 	pm                   PairRecordManager
 	mux                  sync.Mutex
 	tunnels              map[string]Tunnel
+	failedDevices        map[string]failedDevice
 	startTunnelTimeout   time.Duration
 	firstUpdateCompleted bool
 	userspaceTUN         bool
@@ -235,6 +241,7 @@ func NewTunnelManager(pm PairRecordManager, userspaceTUN bool) *TunnelManager {
 		dl:                 deviceList{},
 		pm:                 pm,
 		tunnels:            map[string]Tunnel{},
+		failedDevices:      map[string]failedDevice{},
 		startTunnelTimeout: 10 * time.Second,
 		userspaceTUN:       userspaceTUN,
 		portOffset:         1,
@@ -274,15 +281,26 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 	m.mux.Lock()
 	localTunnels := map[string]Tunnel{}
 	maps.Copy(localTunnels, m.tunnels)
+	localFailed := map[string]failedDevice{}
+	maps.Copy(localFailed, m.failedDevices)
 	m.mux.Unlock()
 
 	devices, err := m.dl.ListDevices()
 	if err != nil {
 		return fmt.Errorf("UpdateTunnels: failed to get list of devices: %w", err)
 	}
+
+	currentUDIDs := make(map[string]bool, len(devices.DeviceList))
+	for _, d := range devices.DeviceList {
+		currentUDIDs[d.Properties.SerialNumber] = true
+	}
+
 	for _, d := range devices.DeviceList {
 		udid := d.Properties.SerialNumber
 		if _, exists := localTunnels[udid]; exists {
+			continue
+		}
+		if shouldSkipDevice(d, localFailed, time.Now()) {
 			continue
 		}
 		if m.userspaceTUN && d.UserspaceTUNPort == 0 {
@@ -294,9 +312,16 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 			log.WithField("udid", udid).
 				WithError(err).
 				Warn("failed to start tunnel")
+			m.mux.Lock()
+			if m.failedDevices == nil {
+				m.failedDevices = map[string]failedDevice{}
+			}
+			m.failedDevices[udid] = failedDevice{lastAttempt: time.Now(), failCount: m.failedDevices[udid].failCount + 1}
+			m.mux.Unlock()
 			continue
 		}
 		m.mux.Lock()
+		delete(m.failedDevices, udid)
 		localTunnels[udid] = t
 		m.tunnels[udid] = t
 		m.mux.Unlock()
@@ -310,9 +335,39 @@ func (m *TunnelManager) UpdateTunnels(ctx context.Context) error {
 		}
 	}
 	m.mux.Lock()
+	for udid := range m.failedDevices {
+		if !currentUDIDs[udid] {
+			delete(m.failedDevices, udid)
+		}
+	}
 	m.firstUpdateCompleted = true
 	m.mux.Unlock()
 	return nil
+}
+
+func shouldSkipDevice(d ios.DeviceEntry, failed map[string]failedDevice, now time.Time) bool {
+	if d.Properties.ConnectionType == "Network" {
+		return true
+	}
+	if f, ok := failed[d.Properties.SerialNumber]; ok && now.Sub(f.lastAttempt) < failedDeviceBackoff(f.failCount) {
+		return true
+	}
+	return false
+}
+
+func failedDeviceBackoff(failCount int) time.Duration {
+	shift := failCount - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 4 {
+		shift = 4
+	}
+	seconds := 30 * (1 << shift)
+	if seconds > 300 {
+		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (m *TunnelManager) RemoveTunnel(ctx context.Context, serialNumber string) error {
