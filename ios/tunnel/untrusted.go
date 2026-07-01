@@ -9,6 +9,8 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"strings"
 
 	"io"
 
@@ -38,8 +40,9 @@ type tunnelService struct {
 	xpcConn *xpc.Connection
 	c       io.Closer
 
-	controlChannel *controlChannelReadWriter
-	cipher         *cipherStream
+	controlChannel     controlChannelIO
+	cipher             *cipherStream
+	pendingPairingData *pairingData
 
 	pairRecords PairRecordManager
 
@@ -58,6 +61,68 @@ func (t *tunnelService) Close() error {
 // If there is already an active pairing with the credentials stored in PairRecordManager this call does not trigger
 // anything on the device and returns with an error
 func (t *tunnelService) ManualPair() error {
+	if err := t.attemptPairVerifyHandshake(); err != nil {
+		return err
+	}
+
+	err := t.verifyPair()
+	if err == nil {
+		return nil
+	}
+	golog.Info("pair verify failed", "module", logModule, "error", err)
+
+	err = t.setupManualPairingSession()
+	if err != nil {
+		return fmt.Errorf("ManualPair: failed to initiate manual pairing: %w", err)
+	}
+
+	return nil
+}
+
+// RepairPairing forces a fresh manual RemotePairing setup on an already-open
+// control channel. This is used by the USB-RSD repair flow to rebuild trust for
+// a later direct WiFi pair verification.
+func (t *tunnelService) RepairPairing() error {
+	if err := t.attemptPairVerifyHandshake(); err != nil {
+		return err
+	}
+
+	if err := t.verifyPair(); err == nil {
+		return nil
+	} else if isRemotePairingConnectionReset(err) {
+		return fmt.Errorf("%w: %v", ErrRemotePairingReset, err)
+	}
+
+	err := t.setupManualPairingSession()
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "pairing rejected") {
+			return fmt.Errorf("%w: %v", ErrRemotePairingRejected, err)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// CheckPairing verifies whether the current host identity is already trusted by
+// the device. It intentionally never starts manual pairing or prompts the user.
+func (t *tunnelService) CheckPairing() (bool, error) {
+	if err := t.attemptPairVerifyHandshake(); err != nil {
+		return false, err
+	}
+
+	if err := t.verifyPair(); err == nil {
+		return true, nil
+	} else if isRemotePairingConnectionReset(err) {
+		return false, fmt.Errorf("%w: %v", ErrRemotePairingReset, err)
+	} else if strings.Contains(strings.ToLower(err.Error()), "pairing rejected") {
+		return false, fmt.Errorf("%w: %v", ErrRemotePairingRejected, err)
+	}
+
+	return false, nil
+}
+
+func (t *tunnelService) attemptPairVerifyHandshake() error {
 	err := t.controlChannel.writeRequest(map[string]interface{}{
 		"handshake": map[string]interface{}{
 			"_0": map[string]interface{}{
@@ -77,36 +142,33 @@ func (t *tunnelService) ManualPair() error {
 	if err != nil {
 		return fmt.Errorf("ManualPair: failed to read 'attemptPairVerify' response: %w", err)
 	}
+	return nil
+}
 
-	err = t.verifyPair()
-	if err == nil {
-		return nil
-	}
-	golog.Info("pair verify failed", "module", logModule, "error", err)
-
-	err = t.setupManualPairing()
+func (t *tunnelService) setupManualPairingSession() error {
+	err := t.setupManualPairing()
 	if err != nil {
-		return fmt.Errorf("ManualPair: failed to initiate manual pairing: %w", err)
+		return err
 	}
 
 	sessionKey, err := t.setupSessionKey()
 	if err != nil {
-		return fmt.Errorf("ManualPair: failed to setup SRP session key: %w", err)
+		return fmt.Errorf("failed to setup SRP session key: %w", err)
 	}
 
 	err = t.exchangeDeviceInfo(sessionKey)
 	if err != nil {
-		return fmt.Errorf("ManualPair: failed to exchange device info: %w", err)
+		return fmt.Errorf("failed to exchange device info: %w", err)
 	}
 
 	err = t.setupCiphers(sessionKey)
 	if err != nil {
-		return fmt.Errorf("ManualPair: failed to setup session ciphers: %w", err)
+		return fmt.Errorf("failed to setup session ciphers: %w", err)
 	}
 
 	_, err = t.createUnlockKey()
 	if err != nil {
-		return fmt.Errorf("ManualPair: failed to create unlock key: %w", err)
+		return fmt.Errorf("failed to create unlock key: %w", err)
 	}
 
 	return nil
@@ -247,6 +309,7 @@ func (t *tunnelService) setupManualPairing() error {
 	event := pairingData{
 		data:            buf.bytes(),
 		kind:            "setupManualPairing",
+		sendingHost:     pairingHostName(),
 		startNewSession: true,
 	}
 
@@ -254,18 +317,65 @@ func (t *tunnelService) setupManualPairing() error {
 	if err != nil {
 		return err
 	}
-	_, err = t.controlChannel.read()
+	m, err := t.controlChannel.read()
 	if err != nil {
 		return err
 	}
-	return err
+	plainEvent, err := getChildMap(m, "plain", "_0", "event", "_0")
+	if err != nil {
+		return err
+	}
+	if rejected, ok := plainEvent["pairingRejectedWithError"]; ok {
+		return fmt.Errorf("pairing rejected: %s", pairingRejectedMessage(rejected))
+	}
+	if _, ok := plainEvent["awaitingUserConsent"]; ok {
+		return nil
+	}
+	if _, ok := plainEvent["pairingData"]; ok {
+		var pending pairingData
+		if err := pending.Decode(plainEvent); err != nil {
+			return err
+		}
+		t.pendingPairingData = &pending
+	}
+	return nil
+}
+
+func pairingHostName() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return "iGeoGo"
+	}
+	return hostname
+}
+
+func pairingRejectedMessage(v interface{}) string {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return fmt.Sprint(v)
+	}
+	wrapped, err := getChildMap(m, "wrappedError", "userInfo")
+	if err == nil {
+		if description, ok := wrapped["NSLocalizedDescription"].(string); ok && description != "" {
+			return description
+		}
+	}
+	if description, ok := m["description"].(string); ok && description != "" {
+		return description
+	}
+	return fmt.Sprint(v)
 }
 
 func (t *tunnelService) readDeviceKey() (publicKey []byte, salt []byte, err error) {
 	var pairingData pairingData
-	err = t.controlChannel.readEvent(&pairingData)
-	if err != nil {
-		return
+	if t.pendingPairingData != nil {
+		pairingData = *t.pendingPairingData
+		t.pendingPairingData = nil
+	} else {
+		err = t.controlChannel.readEvent(&pairingData)
+		if err != nil {
+			return
+		}
 	}
 	publicKey, err = tlvReader(pairingData.data).readCoalesced(typePublicKey)
 	if err != nil {

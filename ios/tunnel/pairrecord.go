@@ -76,6 +76,15 @@ func (p PairRecordManager) StoreDeviceInfo(d device) error {
 	return nil
 }
 
+// DeleteDeviceInfo removes a cached peer record for the given remote identifier.
+func (p PairRecordManager) DeleteDeviceInfo(identifier string) error {
+	devicePath := path.Join(p.peersLocation, fmt.Sprintf("%s.plist", identifier))
+	if err := os.Remove(devicePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("DeleteDeviceInfo: could not remove device info: %w", err)
+	}
+	return nil
+}
+
 func readSelfIdentity(p string) (selfIdentity, error) {
 	content, err := os.ReadFile(p)
 	if err != nil {

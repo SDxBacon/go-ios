@@ -14,6 +14,7 @@ import (
 
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/golog"
+	"github.com/danielpaulus/go-ios/ios/tunnel/tlspsk"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -220,6 +221,10 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("could not setup listener. %w", err)
 	}
+	actualPort := ifacePort
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
+	}
 
 	go listenToConns(iface, listener)
 
@@ -235,6 +240,7 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 		})
 		return err
 	}
+	_, runtime := newTunnelRuntime(ctx, doClose)
 
 	// Optional data-plane telemetry: set GO_IOS_TUNNEL_STATS to log, every 2s,
 	// throughput plus where each pump loop spends wall-time (device read / gVisor
@@ -256,18 +262,109 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 			return
 		}
 		golog.Error("userspace tunnel data plane stopped unexpectedly, tearing down tunnel", "module", logModule, "udid", device.Properties.SerialNumber)
-		_ = doClose()
+		_ = runtime.close()
 	}()
 
 	closeFunc := func() error {
 		explicitClose.Store(true)
-		return doClose()
+		return runtime.close()
 	}
 	return Tunnel{
-		Address: tunnelInfo.ServerAddress,
-		RsdPort: int(tunnelInfo.ServerRSDPort),
-		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		Address:          tunnelInfo.ServerAddress,
+		RsdPort:          int(tunnelInfo.ServerRSDPort),
+		Udid:             device.Properties.SerialNumber,
+		UserspaceTUN:     true,
+		UserspaceTUNPort: actualPort,
+		closer:           closeFunc,
+		done:             runtime.done,
+	}, nil
+}
+
+func connectToUserspaceTCPTunnel(ctx context.Context, tunnelPort uint16, encryptionKey []byte, addr string, device ios.DeviceEntry, ifacePort int) (Tunnel, error) {
+	golog.Info("connect to TCP userspace tunnel endpoint on device", "module", logModule, "udid", device.Properties.SerialNumber, "address", addr, "port", tunnelPort)
+	if len(encryptionKey) == 0 {
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: missing encryption key")
+	}
+
+	tcpConn, err := dialManualPair(ctx, addr, int(tunnelPort))
+	if err != nil {
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: dial: %w", err)
+	}
+	conn, err := tlspsk.Client(tcpConn, encryptionKey)
+	if err != nil {
+		tcpConn.Close()
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: %w: %v", ErrRemotePairingTLSFailed, err)
+	}
+
+	tunnelInfo, err := exchangeCoreTunnelParameters(conn)
+	if err != nil {
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("connectToUserspaceTCPTunnel: %w: %v", ErrRemotePairingCDTunnelFailed, err)
+	}
+	golog.Info("tcp userspace tunnel negotiated", "module", logModule, "udid", device.Properties.SerialNumber, "grantedMtu", tunnelInfo.ClientParameters.Mtu)
+
+	const prefixLength = 64
+	framedConn := newFramedIPv6Conn(conn)
+	iface := UserSpaceTUNInterface{}
+	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), framedConn, tunnelInfo.ClientParameters.Address, prefixLength)
+	if err != nil {
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("could not setup userspace tunnel interface. %w", err)
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
+	if err != nil {
+		iface.networkStack.Close()
+		conn.Close()
+		return Tunnel{}, fmt.Errorf("could not setup userspace tunnel listener. %w", err)
+	}
+
+	actualPort := ifacePort
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
+	}
+
+	go listenToConns(iface, listener)
+
+	var closeOnce sync.Once
+	var explicitClose atomic.Bool
+	statsDone := make(chan struct{})
+	doClose := func() error {
+		var err error
+		closeOnce.Do(func() {
+			close(statsDone)
+			iface.networkStack.Close()
+			err = errors.Join(conn.Close(), listener.Close())
+		})
+		return err
+	}
+	_, runtime := newTunnelRuntime(ctx, doClose)
+
+	if os.Getenv("GO_IOS_TUNNEL_STATS") != "" {
+		go logUserspaceTunnelStats(iface, device.Properties.SerialNumber, statsDone)
+	}
+
+	go func() {
+		iface.endpoint.Wait()
+		if explicitClose.Load() {
+			return
+		}
+		golog.Error("tcp userspace tunnel data plane stopped unexpectedly, tearing down tunnel", "module", logModule, "udid", device.Properties.SerialNumber)
+		_ = runtime.close()
+	}()
+
+	closeFunc := func() error {
+		explicitClose.Store(true)
+		return runtime.close()
+	}
+	return Tunnel{
+		Address:          tunnelInfo.ServerAddress,
+		RsdPort:          int(tunnelInfo.ServerRSDPort),
+		Udid:             device.Properties.SerialNumber,
+		UserspaceTUN:     true,
+		UserspaceTUNPort: actualPort,
+		closer:           closeFunc,
+		done:             runtime.done,
 	}, nil
 }
 
